@@ -36,6 +36,77 @@
 
 #include "OLEDDisplay.h"
 
+// Binary search for a Unicode code point in the font map
+// Returns the index in the map, or -1 if not found
+static int16_t findInFontMap(const FontUTF8* font, uint16_t codepoint) {
+  int16_t left = 0;
+  int16_t right = font->count - 1;
+  
+  while (left <= right) {
+    int16_t mid = (left + right) >> 1;
+    uint16_t midCodepoint = pgm_read_word(&font->map[mid]);
+    
+    if (midCodepoint == codepoint) {
+      return mid;
+    } else if (midCodepoint < codepoint) {
+      left = mid + 1;
+    } else {
+      right = mid - 1;
+    }
+  }
+  
+  return -1;
+}
+
+// Decode a UTF-8 character, advancing the position pointer
+// Returns the Unicode code point, or 0 if invalid
+static uint16_t decodeUtf8(const char* str, uint16_t* pos, uint16_t length) {
+  if (*pos >= length) return 0;
+  
+  uint8_t first = (uint8_t)str[*pos];
+  (*pos)++;
+  
+  // Single byte ASCII
+  if (first < 0x80) {
+    return first;
+  }
+  
+  // Multi-byte UTF-8
+  uint16_t codepoint = 0;
+  uint8_t continuationBytes = 0;
+  
+  if ((first & 0xE0) == 0xC0) {
+    // 2-byte sequence
+    codepoint = first & 0x1F;
+    continuationBytes = 1;
+  } else if ((first & 0xF0) == 0xE0) {
+    // 3-byte sequence
+    codepoint = first & 0x0F;
+    continuationBytes = 2;
+  } else if ((first & 0xF8) == 0xF0) {
+    // 4-byte sequence
+    codepoint = first & 0x07;
+    continuationBytes = 3;
+  } else {
+    // Invalid UTF-8 start byte
+    return 0;
+  }
+  
+  // Read continuation bytes
+  for (uint8_t i = 0; i < continuationBytes && *pos < length; i++) {
+    uint8_t cont = (uint8_t)str[*pos];
+    (*pos)++;
+    if ((cont & 0xC0) != 0x80) {
+      // Invalid continuation byte
+      return 0;
+    }
+    codepoint = (codepoint << 6) | (cont & 0x3F);
+  }
+  
+  return codepoint;
+}
+
+
 OLEDDisplay::OLEDDisplay() {
 
 	displayWidth = 128;
@@ -47,6 +118,8 @@ OLEDDisplay::OLEDDisplay() {
 	textAlignment = TEXT_ALIGN_LEFT;
 	fontData = ArialMT_Plain_10;
 	fontTableLookupFunction = DefaultFontTableLookup;
+	utf8Font = nullptr;
+	usingUtf8Font = false;
 	buffer = NULL;
 #ifdef OLEDDISPLAY_DOUBLE_BUFFER
 	buffer_back = NULL;
@@ -554,63 +627,165 @@ void OLEDDisplay::drawIco16x16(int16_t xMove, int16_t yMove, const uint8_t *ico,
 }
 
 uint16_t OLEDDisplay::drawStringInternal(int16_t xMove, int16_t yMove, const char* text, uint16_t textLength, uint16_t textWidth, bool utf8) {
-  uint8_t textHeight       = pgm_read_byte(fontData + HEIGHT_POS);
-  uint8_t firstChar        = pgm_read_byte(fontData + FIRST_CHAR_POS);
-  uint16_t sizeOfJumpTable = pgm_read_byte(fontData + CHAR_NUM_POS)  * JUMPTABLE_BYTES;
+  uint16_t charCount = 0;
+  uint16_t cursorX = 0;
+  uint16_t cursorY = 0;
 
-  uint16_t cursorX         = 0;
-  uint16_t cursorY         = 0;
-  uint16_t charCount       = 0;
+  bool hasUtf8Bytes = false;
+  if (utf8) {
+    for (uint16_t i = 0; i < textLength; i++) {
+      if (((uint8_t)text[i]) >= 0x80) {
+        hasUtf8Bytes = true;
+        break;
+      }
+    }
+  }
+  const bool useUtf8Font = (usingUtf8Font && utf8 && hasUtf8Bytes);
+
+  const uint8_t legacyTextHeight = pgm_read_byte(fontData + HEIGHT_POS);
+  const uint8_t drawTextHeight = useUtf8Font ? utf8Font->h : legacyTextHeight;
+
+  // 这里在需要对齐(居中/右对齐)时重新计算一次宽度。
+  uint16_t effectiveTextWidth = textWidth;
+  if (useUtf8Font && textWidth > 0 && (textAlignment == TEXT_ALIGN_CENTER_BOTH || textAlignment == TEXT_ALIGN_CENTER || textAlignment == TEXT_ALIGN_RIGHT)) {
+    uint8_t firstChar = pgm_read_byte(fontData + FIRST_CHAR_POS);
+    uint8_t charNum = pgm_read_byte(fontData + CHAR_NUM_POS);
+
+    effectiveTextWidth = 0;
+    uint16_t pos = 0;
+    while (pos < textLength) {
+      uint16_t codepoint = decodeUtf8(text, &pos, textLength);
+      if (codepoint == 0) continue;
+
+      if (codepoint < 0x80) {
+        uint8_t code = (uint8_t)codepoint;
+        code = (this->fontTableLookupFunction)(code);
+        if (code == 0) continue;
+        if (code >= firstChar) {
+          uint8_t charCode = code - firstChar;
+          if (charCode < charNum) {
+            effectiveTextWidth += pgm_read_byte(fontData + JUMPTABLE_START + charCode * JUMPTABLE_BYTES + JUMPTABLE_WIDTH);
+          }
+        }
+      } else {
+        // 非 ASCII：按 UTF8 字体等宽处理
+        effectiveTextWidth += utf8Font->w;
+      }
+    }
+  }
 
   switch (textAlignment) {
     case TEXT_ALIGN_CENTER_BOTH:
-      yMove -= textHeight >> 1;
+      yMove -= drawTextHeight >> 1;
     // Fallthrough
     case TEXT_ALIGN_CENTER:
-      xMove -= textWidth >> 1; // divide by 2
+      xMove -= effectiveTextWidth >> 1; // divide by 2
       break;
     case TEXT_ALIGN_RIGHT:
-      xMove -= textWidth;
+      xMove -= effectiveTextWidth;
       break;
     case TEXT_ALIGN_LEFT:
       break;
   }
 
   // Don't draw anything if it is not on the screen.
-  if (xMove + textWidth  < 0 || xMove >= this->width() ) {return 0;}
-  if (yMove + textHeight < 0 || yMove >= this->height()) {return 0;}
+  if (xMove + effectiveTextWidth  < 0 || xMove >= this->width() ) {return 0;}
+  if (yMove + drawTextHeight < 0 || yMove >= this->height()) {return 0;}
 
-  for (uint16_t j = 0; j < textLength; j++) {
-    int16_t xPos = xMove + cursorX;
-    int16_t yPos = yMove + cursorY;
-    if (xPos > this->width())
-      break; // no need to continue
-    charCount++;
+  if (useUtf8Font) {
+    // UTF8字体模式(支持混合渲染)：
+    // - 非 ASCII： UTF8 字体绘制
+    // - ASCII：回退到传统字体绘制
+    uint8_t textHeight       = legacyTextHeight;
+    uint8_t firstChar        = pgm_read_byte(fontData + FIRST_CHAR_POS);
+    uint8_t charNum          = pgm_read_byte(fontData + CHAR_NUM_POS);
+    uint16_t sizeOfJumpTable = charNum * JUMPTABLE_BYTES;
 
-    uint8_t code;
-    if (utf8) {
-      code = (this->fontTableLookupFunction)(text[j]);
-      if (code == 0)
-        continue;
-    } else
-      code = text[j];
-    if (code >= firstChar) {
-      uint8_t charCode = code - firstChar;
+    uint16_t pos = 0;
+    while (pos < textLength) {
+      uint16_t codepoint = decodeUtf8(text, &pos, textLength);
+      if (codepoint == 0) continue;
 
-      // 4 Bytes per char code
-      uint8_t msbJumpToChar    = pgm_read_byte( fontData + JUMPTABLE_START + charCode * JUMPTABLE_BYTES );                  // MSB  \ JumpAddress
-      uint8_t lsbJumpToChar    = pgm_read_byte( fontData + JUMPTABLE_START + charCode * JUMPTABLE_BYTES + JUMPTABLE_LSB);   // LSB /
-      uint8_t charByteSize     = pgm_read_byte( fontData + JUMPTABLE_START + charCode * JUMPTABLE_BYTES + JUMPTABLE_SIZE);  // Size
-      uint8_t currentCharWidth = pgm_read_byte( fontData + JUMPTABLE_START + charCode * JUMPTABLE_BYTES + JUMPTABLE_WIDTH); // Width
+      int16_t xPos = xMove + cursorX;
+      int16_t yPos = yMove + cursorY;
+      if (xPos > this->width()) break;
 
-      // Test if the char is drawable
-      if (!(msbJumpToChar == 255 && lsbJumpToChar == 255)) {
-        // Get the position of the char data
-        uint16_t charDataPosition = JUMPTABLE_START + sizeOfJumpTable + ((msbJumpToChar << 8) + lsbJumpToChar);
-        drawInternal(xPos, yPos, currentCharWidth, textHeight, fontData, charDataPosition, charByteSize);
+      if (codepoint < 0x80) {
+        // ASCII -> 传统字体
+        uint8_t code = (uint8_t)codepoint;
+        code = (this->fontTableLookupFunction)(code);
+        if (code == 0) continue;
+
+        if (code >= firstChar) {
+          uint8_t charCode = code - firstChar;
+          if (charCode < charNum) {
+            uint8_t msbJumpToChar    = pgm_read_byte(fontData + JUMPTABLE_START + charCode * JUMPTABLE_BYTES);
+            uint8_t lsbJumpToChar    = pgm_read_byte(fontData + JUMPTABLE_START + charCode * JUMPTABLE_BYTES + JUMPTABLE_LSB);
+            uint8_t charByteSize     = pgm_read_byte(fontData + JUMPTABLE_START + charCode * JUMPTABLE_BYTES + JUMPTABLE_SIZE);
+            uint8_t currentCharWidth = pgm_read_byte(fontData + JUMPTABLE_START + charCode * JUMPTABLE_BYTES + JUMPTABLE_WIDTH);
+
+            if (!(msbJumpToChar == 255 && lsbJumpToChar == 255)) {
+              uint16_t charDataPosition = JUMPTABLE_START + sizeOfJumpTable + ((msbJumpToChar << 8) + lsbJumpToChar);
+              drawInternal(xPos, yPos, currentCharWidth, textHeight, fontData, charDataPosition, charByteSize);
+            }
+
+            cursorX += currentCharWidth;
+            charCount++;
+          }
+        }
+      } else {
+        // 非 ASCII -> UTF8 字体(若缺字则留空，但仍推进光标避免覆盖)
+        int16_t glyphIndex = findInFontMap(utf8Font, codepoint);
+        if (glyphIndex >= 0) {
+          drawUtf8Glyph(xPos, yPos, utf8Font, glyphIndex);
+          charCount++;
+        }
+        cursorX += utf8Font->w;
       }
+    }
+  } else {
+    // 传统字体模式
+    uint8_t textHeight       = pgm_read_byte(fontData + HEIGHT_POS);
+    uint8_t firstChar        = pgm_read_byte(fontData + FIRST_CHAR_POS);
+    uint8_t charNum          = pgm_read_byte(fontData + CHAR_NUM_POS);
+    uint16_t sizeOfJumpTable = charNum * JUMPTABLE_BYTES;
 
-      cursorX += currentCharWidth;
+    for (uint16_t j = 0; j < textLength; j++) {
+      int16_t xPos = xMove + cursorX;
+      int16_t yPos = yMove + cursorY;
+      if (xPos > this->width())
+        break; // no need to continue
+      charCount++;
+
+      uint8_t code;
+      if (utf8) {
+        code = (this->fontTableLookupFunction)(text[j]);
+        if (code == 0)
+          continue;
+      } else
+        code = text[j];
+      if (code >= firstChar) {
+        uint8_t charCode = code - firstChar;
+
+        if (charCode >= charNum) {
+          continue;
+        }
+
+        // 4 Bytes per char code
+        uint8_t msbJumpToChar    = pgm_read_byte( fontData + JUMPTABLE_START + charCode * JUMPTABLE_BYTES );                  // MSB  \ JumpAddress
+        uint8_t lsbJumpToChar    = pgm_read_byte( fontData + JUMPTABLE_START + charCode * JUMPTABLE_BYTES + JUMPTABLE_LSB);   // LSB /
+        uint8_t charByteSize     = pgm_read_byte( fontData + JUMPTABLE_START + charCode * JUMPTABLE_BYTES + JUMPTABLE_SIZE);  // Size
+        uint8_t currentCharWidth = pgm_read_byte( fontData + JUMPTABLE_START + charCode * JUMPTABLE_BYTES + JUMPTABLE_WIDTH); // Width
+
+        // Test if the char is drawable
+        if (!(msbJumpToChar == 255 && lsbJumpToChar == 255)) {
+          // Get the position of the char data
+          uint16_t charDataPosition = JUMPTABLE_START + sizeOfJumpTable + ((msbJumpToChar << 8) + lsbJumpToChar);
+          drawInternal(xPos, yPos, currentCharWidth, textHeight, fontData, charDataPosition, charByteSize);
+        }
+
+        cursorX += currentCharWidth;
+      }
     }
   }
   return charCount;
@@ -758,6 +933,50 @@ void OLEDDisplay::setFont(const uint8_t *fontData) {
 
 void OLEDDisplay::setFont(const char *fontData) {
   setFont(static_cast<const uint8_t*>(reinterpret_cast<const void*>(fontData)));
+}
+
+void OLEDDisplay::setUtf8Font(const FontUTF8* font) {
+  this->utf8Font = font;
+  this->usingUtf8Font = (font != nullptr);
+  // New font, so must recalculate
+  setLogBuffer();
+}
+
+// Draw a UTF-8 glyph from the font data
+void OLEDDisplay::drawUtf8Glyph(int16_t xMove, int16_t yMove, const FontUTF8* font, uint16_t glyphIndex) {
+  if (!font || glyphIndex >= font->count) return;
+
+  uint8_t charWidth = font->w;
+  uint8_t charHeight = font->h;
+
+  // Calculate the offset in the data array
+  // Each glyph is charWidth * charHeight bits = charWidth * charHeight / 8 bytes
+  uint16_t glyphBytes = ((charWidth * charHeight) + 7) >> 3; // ceiling division by 8
+  uint32_t dataOffset = (uint32_t)glyphIndex * glyphBytes;
+
+  if (charWidth == 12 && charHeight == 12) {
+    // Special handling for 12x12 font: data is continuous bits (row-major), convert to column-major pages
+    uint8_t tempBuffer[24]; // 12 columns * 2 pages
+    memset(tempBuffer, 0, sizeof(tempBuffer));
+
+    // Read continuous data: bitIndex = y * 12 + x
+    for (uint16_t bitIndex = 0; bitIndex < 144; bitIndex++) {
+      uint16_t y = bitIndex / 12;
+      uint16_t x = bitIndex % 12;
+      uint16_t page = y / 8;
+      uint16_t bitInPage = y % 8;
+      uint16_t byteIdx = bitIndex / 8;
+      uint8_t bitInByte = bitIndex % 8;
+      uint8_t byte = pgm_read_byte(font->data + dataOffset + byteIdx);
+      if (byte & (1 << bitInByte)) {
+        tempBuffer[x * 2 + page] |= (1 << bitInPage);
+      }
+    }
+
+    drawInternal(xMove, yMove, charWidth, charHeight, tempBuffer, 0, 24);
+  } else {
+    drawInternal(xMove, yMove, charWidth, charHeight, font->data, dataOffset, glyphBytes);
+  }
 }
 
 void OLEDDisplay::displayOn(void) {

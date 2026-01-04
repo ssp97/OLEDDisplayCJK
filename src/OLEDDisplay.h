@@ -62,6 +62,7 @@ private:
 #endif
 
 #include "OLEDDisplayFonts.h"
+#include "FontUTF8.h"
 
 //#define DEBUG_OLEDDISPLAY(...) Serial.printf( __VA_ARGS__ )
 //#define DEBUG_OLEDDISPLAY(...) dprintf("%s",  __VA_ARGS__ )
@@ -245,6 +246,8 @@ class OLEDDisplay : public Stream {
     // Draws a string at the given location, returns how many chars have been written
     uint16_t drawString(int16_t x, int16_t y, const String &text);
 
+    void drawUtf8Glyph(int16_t xMove, int16_t yMove, const FontUTF8* font, uint16_t glyphIndex);
+
     // Draws a formatted string (like printf) at the given location
     void drawStringf(int16_t x, int16_t y, char* buffer, String format, ... );
 
@@ -273,6 +276,10 @@ class OLEDDisplay : public Stream {
 
     // Set the current font when supplied as a char* instead of a uint8_t*
     void setFont(const char *fontData);
+
+    // Set UTF8 font for displaying CJK and other Unicode characters
+    // When set, fontTableLookupFunction will be ignored
+    void setUtf8Font(const FontUTF8* font);
 
     // Set the function that will convert utf-8 to font table index
     void setFontTableLookupFunction(FontTableLookupFunction function);
@@ -370,6 +377,8 @@ class OLEDDisplay : public Stream {
     OLEDDISPLAY_COLOR            color;
 
     const uint8_t	 *fontData;
+    const FontUTF8	 *utf8Font;     // UTF8 font structure pointer
+    bool               usingUtf8Font; // Flag indicating if UTF8 font is active
 
     // State values for logBuffer
     uint16_t   logBufferSize;
