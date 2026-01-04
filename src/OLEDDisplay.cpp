@@ -837,79 +837,244 @@ void OLEDDisplay::drawStringf( int16_t x, int16_t y, char* buffer, String format
 }
 
 uint16_t OLEDDisplay::drawStringMaxWidth(int16_t xMove, int16_t yMove, uint16_t maxLineWidth, const String &strUser) {
-  uint16_t firstChar  = pgm_read_byte(fontData + FIRST_CHAR_POS);
-  uint16_t lineHeight = pgm_read_byte(fontData + HEIGHT_POS);
+  const uint16_t firstChar  = pgm_read_byte(fontData + FIRST_CHAR_POS);
 
   const char* text = strUser.c_str();
+  const uint16_t length = strlen(text);
 
-  uint16_t length = strlen(text);
-  uint16_t lastDrawnPos = 0;
+  // Detect if we should use the UTF8 font path (for CJK etc.)
+  bool hasUtf8Bytes = false;
+  if (usingUtf8Font) {
+    for (uint16_t i = 0; i < length; i++) {
+      if (((uint8_t)text[i]) >= 0x80) {
+        hasUtf8Bytes = true;
+        break;
+      }
+    }
+  }
+  const bool useUtf8Font = (usingUtf8Font && utf8Font != nullptr && hasUtf8Bytes);
+
+  const uint16_t legacyLineHeight = pgm_read_byte(fontData + HEIGHT_POS);
+  const uint16_t lineHeight = useUtf8Font ? utf8Font->h : legacyLineHeight;
+
+  uint16_t lastDrawnPos = 0; // byte index
   uint16_t lineNumber = 0;
   uint16_t strWidth = 0;
 
-  uint16_t preferredBreakpoint = 0;
+  uint16_t preferredBreakpoint = 0; // byte index (start of next chunk)
   uint16_t widthAtBreakpoint = 0;
-  uint16_t firstLineChars = 0;
-  uint16_t drawStringResult = 1; // later tested for 0 == error, so initialize to 1
+  uint16_t firstLineChars = 0;      // historical behavior: byte index for ASCII; keep byte index for UTF-8 too
+  uint16_t drawStringResult = 1;    // later tested for 0 == error, so initialize to 1
 
-  for (uint16_t i = 0; i < length; i++) {
-    char c = (this->fontTableLookupFunction)(text[i]);
-    if (c == 0)
-      continue;
-    strWidth += pgm_read_byte(fontData + JUMPTABLE_START + (c - firstChar) * JUMPTABLE_BYTES + JUMPTABLE_WIDTH);
+  if (useUtf8Font) {
+    // UTF-8 aware wrapping: do NOT split multi-byte sequences.
+    uint16_t pos = 0;
+    while (pos < length) {
+      const uint16_t charStart = pos;
+      const uint16_t codepoint = decodeUtf8(text, &pos, length);
+      if (codepoint == 0) {
+        continue;
+      }
 
-    // Always try to break on a space, dash or slash
-    if (text[i] == ' ' || text[i]== '-' || text[i] == '/') {
-      preferredBreakpoint = i + 1;
-      widthAtBreakpoint = strWidth;
-    }
+      // Hard line break support
+      if (codepoint == '\n') {
+        drawStringResult = drawStringInternal(xMove, yMove + (lineNumber++) * lineHeight, &text[lastDrawnPos], charStart - lastDrawnPos, strWidth, true);
+        if (firstLineChars == 0) {
+          firstLineChars = charStart;
+        }
+        lastDrawnPos = pos;
+        strWidth = 0;
+        preferredBreakpoint = 0;
+        widthAtBreakpoint = 0;
+        if (drawStringResult == 0) break;
+        continue;
+      }
 
-    if (strWidth >= maxLineWidth) {
-      if (preferredBreakpoint == 0) {
-        preferredBreakpoint = i;
+      uint16_t charWidth = 0;
+      if (codepoint < 0x80) {
+        uint8_t c = (uint8_t)codepoint;
+        c = (this->fontTableLookupFunction)(c);
+        if (c == 0) {
+          continue;
+        }
+        if (c < firstChar) {
+          continue;
+        }
+        charWidth = pgm_read_byte(fontData + JUMPTABLE_START + (c - firstChar) * JUMPTABLE_BYTES + JUMPTABLE_WIDTH);
+      } else {
+        // Match drawStringInternal(): even if glyph missing, we still advance by fixed width.
+        charWidth = utf8Font->w;
+      }
+
+      strWidth += charWidth;
+
+      // Always try to break on a space, dash or slash
+      if (codepoint == ' ' || codepoint == '-' || codepoint == '/') {
+        preferredBreakpoint = pos; // include the breakpoint character
         widthAtBreakpoint = strWidth;
       }
-      drawStringResult = drawStringInternal(xMove, yMove + (lineNumber++) * lineHeight , &text[lastDrawnPos], preferredBreakpoint - lastDrawnPos, widthAtBreakpoint, true);
-      if (firstLineChars == 0)
-        firstLineChars = preferredBreakpoint;
-      lastDrawnPos = preferredBreakpoint;
-      // It is possible that we did not draw all letters to i so we need
-      // to account for the width of the chars from `i - preferredBreakpoint`
-      // by calculating the width we did not draw yet.
-      strWidth = strWidth - widthAtBreakpoint;
-      preferredBreakpoint = 0;
-      if (drawStringResult == 0) // we are past the display already?
-        break;
+
+      if (strWidth >= maxLineWidth) {
+        uint16_t breakPos = preferredBreakpoint;
+        uint16_t drawnWidth = widthAtBreakpoint;
+
+        // No suitable breakpoint on this line: wrap before current codepoint.
+        if (breakPos == 0 || breakPos <= lastDrawnPos) {
+          if (charStart == lastDrawnPos) {
+            // Single glyph wider than maxLineWidth: still draw it to make progress.
+            breakPos = pos;
+            drawnWidth = strWidth;
+          } else {
+            breakPos = charStart;
+            drawnWidth = strWidth - charWidth;
+          }
+        }
+
+        drawStringResult = drawStringInternal(xMove, yMove + (lineNumber++) * lineHeight, &text[lastDrawnPos], breakPos - lastDrawnPos, drawnWidth, true);
+        if (firstLineChars == 0) {
+          firstLineChars = breakPos;
+        }
+        lastDrawnPos = breakPos;
+
+        // Keep width of not-yet-drawn chars (between breakPos and current pos) for the next line.
+        strWidth = strWidth - drawnWidth;
+
+        preferredBreakpoint = 0;
+        widthAtBreakpoint = 0;
+
+        if (drawStringResult == 0) {
+          break;
+        }
+      }
+    }
+  } else {
+    // Legacy byte-based wrapping (extended ASCII via fontTableLookupFunction)
+    for (uint16_t i = 0; i < length; i++) {
+      char c = (this->fontTableLookupFunction)(text[i]);
+      if (c == 0) {
+        continue;
+      }
+
+      if ((uint8_t)c < firstChar) {
+        continue;
+      }
+
+      const uint16_t charWidth = pgm_read_byte(fontData + JUMPTABLE_START + (c - firstChar) * JUMPTABLE_BYTES + JUMPTABLE_WIDTH);
+      strWidth += charWidth;
+
+      // Always try to break on a space, dash or slash
+      if (text[i] == ' ' || text[i] == '-' || text[i] == '/') {
+        preferredBreakpoint = i + 1;
+        widthAtBreakpoint = strWidth;
+      }
+
+      if (strWidth >= maxLineWidth) {
+        // No preferred breakpoint on this line: wrap before current byte.
+        if (preferredBreakpoint == 0 || preferredBreakpoint <= lastDrawnPos) {
+          if (i == lastDrawnPos) {
+            // Single glyph wider than maxLineWidth: still draw it to make progress.
+            preferredBreakpoint = i + 1;
+            widthAtBreakpoint = strWidth;
+          } else {
+            preferredBreakpoint = i;
+            widthAtBreakpoint = strWidth - charWidth;
+          }
+        }
+
+        drawStringResult = drawStringInternal(xMove, yMove + (lineNumber++) * lineHeight, &text[lastDrawnPos], preferredBreakpoint - lastDrawnPos, widthAtBreakpoint, true);
+        if (firstLineChars == 0) {
+          firstLineChars = preferredBreakpoint;
+        }
+        lastDrawnPos = preferredBreakpoint;
+
+        // Keep width of not-yet-drawn bytes (between preferredBreakpoint and current i)
+        strWidth = strWidth - widthAtBreakpoint;
+        preferredBreakpoint = 0;
+        widthAtBreakpoint = 0;
+
+        if (drawStringResult == 0) {
+          break;
+        }
+      }
     }
   }
 
   // Draw last part if needed
   if (drawStringResult != 0 && lastDrawnPos < length) {
-    drawStringResult = drawStringInternal(xMove, yMove + (lineNumber++) * lineHeight , &text[lastDrawnPos], length - lastDrawnPos, getStringWidth(&text[lastDrawnPos], length - lastDrawnPos, true), true);
+    const uint16_t tailLen = length - lastDrawnPos;
+    drawStringResult = drawStringInternal(xMove, yMove + (lineNumber++) * lineHeight, &text[lastDrawnPos], tailLen, getStringWidth(&text[lastDrawnPos], tailLen, true), true);
   }
 
-  if (drawStringResult == 0 || (yMove + lineNumber * lineHeight) >= this->height()) // text did not fit on screen
+  if (drawStringResult == 0 || (yMove + lineNumber * lineHeight) >= this->height()) {
+    // text did not fit on screen
     return firstLineChars;
+  }
   return 0; // everything was drawn
 }
 
 uint16_t OLEDDisplay::getStringWidth(const char* text, uint16_t length, bool utf8) {
-  uint16_t firstChar        = pgm_read_byte(fontData + FIRST_CHAR_POS);
+  const uint16_t firstChar = pgm_read_byte(fontData + FIRST_CHAR_POS);
+
+  // UTF8 font active? Then measure by codepoints (so CJK counts as one glyph width).
+  bool hasUtf8Bytes = false;
+  if (utf8 && usingUtf8Font && utf8Font != nullptr) {
+    for (uint16_t i = 0; i < length; i++) {
+      if (((uint8_t)text[i]) >= 0x80) {
+        hasUtf8Bytes = true;
+        break;
+      }
+    }
+  }
+  const bool useUtf8Font = (utf8 && usingUtf8Font && utf8Font != nullptr && hasUtf8Bytes);
 
   uint16_t stringWidth = 0;
   uint16_t maxWidth = 0;
 
-  for (uint16_t i = 0; i < length; i++) {
-    char c = text[i];
-    if (utf8) {
-      c = (this->fontTableLookupFunction)(c);
-      if (c == 0)
+  if (useUtf8Font) {
+    uint16_t pos = 0;
+    while (pos < length) {
+      uint16_t codepoint = decodeUtf8(text, &pos, length);
+      if (codepoint == 0) {
         continue;
+      }
+
+      if (codepoint == '\n') {
+        maxWidth = max(maxWidth, stringWidth);
+        stringWidth = 0;
+        continue;
+      }
+
+      if (codepoint < 0x80) {
+        uint8_t c = (uint8_t)codepoint;
+        c = (this->fontTableLookupFunction)(c);
+        if (c == 0) {
+          continue;
+        }
+        if (c < firstChar) {
+          continue;
+        }
+        stringWidth += pgm_read_byte(fontData + JUMPTABLE_START + (c - firstChar) * JUMPTABLE_BYTES + JUMPTABLE_WIDTH);
+      } else {
+        stringWidth += utf8Font->w;
+      }
     }
-    stringWidth += pgm_read_byte(fontData + JUMPTABLE_START + (c - firstChar) * JUMPTABLE_BYTES + JUMPTABLE_WIDTH);
-    if (c == 10) {
-      maxWidth = max(maxWidth, stringWidth);
-      stringWidth = 0;
+  } else {
+    for (uint16_t i = 0; i < length; i++) {
+      char c = text[i];
+      if (utf8) {
+        c = (this->fontTableLookupFunction)(c);
+        if (c == 0) {
+          continue;
+        }
+      }
+      if ((uint8_t)c < firstChar) {
+        continue;
+      }
+      stringWidth += pgm_read_byte(fontData + JUMPTABLE_START + (c - firstChar) * JUMPTABLE_BYTES + JUMPTABLE_WIDTH);
+      if (c == 10) {
+        maxWidth = max(maxWidth, stringWidth);
+        stringWidth = 0;
+      }
     }
   }
 
