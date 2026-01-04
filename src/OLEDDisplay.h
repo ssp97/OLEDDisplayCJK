@@ -61,6 +61,8 @@ private:
 #error "Unkown operating system"
 #endif
 
+#include <cstdarg>
+
 #include "OLEDDisplayFonts.h"
 #include "FontUTF8.h"
 
