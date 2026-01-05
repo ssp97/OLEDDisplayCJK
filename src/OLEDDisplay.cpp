@@ -1082,7 +1082,7 @@ uint16_t OLEDDisplay::getStringWidth(const char* text, uint16_t length, bool utf
 }
 
 uint16_t OLEDDisplay::getStringWidth(const String &strUser) {
-  uint16_t width = getStringWidth(strUser.c_str(), strUser.length());
+  uint16_t width = getStringWidth(strUser.c_str(), strUser.length(), true);
   return width;
 }
 
