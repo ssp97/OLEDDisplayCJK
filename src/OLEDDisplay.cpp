@@ -1086,6 +1086,21 @@ uint16_t OLEDDisplay::getStringWidth(const String &strUser) {
   return width;
 }
 
+std::vector<uint16_t> getUnicodeCodePoints(const String &text){
+  uint16_t pos = 0;
+  uint16_t length = text.length();
+  const char* ctext = text.c_str();
+  std::vector<uint16_t> result;
+  while (pos < length) {
+      uint16_t codepoint = decodeUtf8(ctext, &pos, length);
+      if (codepoint == 0) {
+        continue;
+      }
+      result.push_back(codepoint);
+  }
+  return result;
+}
+
 void OLEDDisplay::setTextAlignment(OLEDDISPLAY_TEXT_ALIGNMENT textAlignment) {
   this->textAlignment = textAlignment;
 }

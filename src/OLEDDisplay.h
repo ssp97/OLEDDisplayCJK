@@ -62,6 +62,7 @@ private:
 #endif
 
 #include <cstdarg>
+#include <vector>
 
 #include "OLEDDisplayFonts.h"
 #include "FontUTF8.h"
@@ -266,6 +267,8 @@ class OLEDDisplay : public Stream {
 
     // Convencience method for the const char version
     uint16_t getStringWidth(const String &text);
+
+    std::vector<uint16_t> getUnicodeCodePoints(const String &text);
 
     // Specifies relative to which anchor point
     // the text is rendered. Available constants:
