@@ -1155,7 +1155,11 @@ void OLEDDisplay::drawUtf8Glyph(int16_t xMove, int16_t yMove, const FontUTF8* fo
 
     drawInternal(xMove, yMove, charWidth, charHeight, tempBuffer, 0, 24);
   } else {
-    drawInternal(xMove, yMove, charWidth, charHeight, font->data, dataOffset, glyphBytes);
+    // NOTE:
+    // drawInternal() historically uses a uint16_t offset. Large UTF8 font tables (16x16/24x24)
+    // easily exceed 64KB, and passing a 32-bit dataOffset would truncate and pick the wrong glyph.
+    // Fix by applying the offset to the pointer and always passing offset=0.
+    drawInternal(xMove, yMove, charWidth, charHeight, font->data + dataOffset, 0, glyphBytes);
   }
 }
 
