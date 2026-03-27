@@ -79,6 +79,12 @@ private:
 #define OLEDDISPLAY_DOUBLE_BUFFER
 #endif
 
+// Add extra blank rows above UTF-8 glyphs (for mixed CJK/ASCII visual alignment tuning).
+// Override at build time, e.g. -DOLEDDISPLAY_UTF8_TOP_PADDING=1
+#ifndef OLEDDISPLAY_UTF8_TOP_PADDING
+#define OLEDDISPLAY_UTF8_TOP_PADDING 0
+#endif
+
 // Header Values
 #define JUMPTABLE_BYTES 4
 
