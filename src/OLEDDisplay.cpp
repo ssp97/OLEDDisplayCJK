@@ -1134,26 +1134,28 @@ void OLEDDisplay::drawUtf8Glyph(int16_t xMove, int16_t yMove, const FontUTF8* fo
   uint16_t glyphBytes = ((charWidth * charHeight) + 7) >> 3; // ceiling division by 8
   uint32_t dataOffset = (uint32_t)glyphIndex * glyphBytes;
 
-  if (charWidth == 12 && charHeight == 12) {
-    // Special handling for 12x12 font: data is continuous bits (row-major), convert to column-major pages
-    uint8_t tempBuffer[24]; // 12 columns * 2 pages
+  if ((charWidth == 10 && charHeight == 10) || (charWidth == 12 && charHeight == 12)) {
+    // Special handling for 10x10/12x12 fonts: data is continuous bits (row-major), convert to column-major pages
+    const uint8_t pages = (charHeight + 7) / 8;
+    uint8_t tempBuffer[24]; // max: 12 columns * 2 pages
     memset(tempBuffer, 0, sizeof(tempBuffer));
 
-    // Read continuous data: bitIndex = y * 12 + x
-    for (uint16_t bitIndex = 0; bitIndex < 144; bitIndex++) {
-      uint16_t y = bitIndex / 12;
-      uint16_t x = bitIndex % 12;
+    // Read continuous data: bitIndex = y * width + x
+    const uint16_t totalBits = (uint16_t)charWidth * (uint16_t)charHeight;
+    for (uint16_t bitIndex = 0; bitIndex < totalBits; bitIndex++) {
+      uint16_t y = bitIndex / charWidth;
+      uint16_t x = bitIndex % charWidth;
       uint16_t page = y / 8;
       uint16_t bitInPage = y % 8;
       uint16_t byteIdx = bitIndex / 8;
       uint8_t bitInByte = bitIndex % 8;
       uint8_t byte = pgm_read_byte(font->data + dataOffset + byteIdx);
       if (byte & (1 << bitInByte)) {
-        tempBuffer[x * 2 + page] |= (1 << bitInPage);
+        tempBuffer[x * pages + page] |= (1 << bitInPage);
       }
     }
 
-    drawInternal(xMove, yMove, charWidth, charHeight, tempBuffer, 0, 24);
+    drawInternal(xMove, yMove, charWidth, charHeight, tempBuffer, 0, charWidth * pages);
   } else {
     // NOTE:
     // drawInternal() historically uses a uint16_t offset. Large UTF8 font tables (16x16/24x24)
